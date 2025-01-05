@@ -134,7 +134,7 @@ pub const Process = struct {
         defer p.close();
 
         // Optimistically check if process is already ended.
-        if ((p.wait(0) catch @panic("todo")) == null) return;
+        if ((p.wait(0) catch @panic("todo"))) |_| return;
 
         // Ask nicely with SIGTERM.
         p.signal(posix.SIG.TERM) catch @panic("todo");
@@ -174,7 +174,11 @@ pub const Process = struct {
 
             // Other timeout.
             var poll_fds = [_]posix.pollfd{.{ .fd = p.fd, .events = linux.POLL.IN, .revents = 0 }};
-            if ((try posix.poll(&poll_fds, arg_timeout_ms)) == 0) return null;
+            const ready = posix.poll(&poll_fds, arg_timeout_ms) catch |e| switch (e) {
+                error.NetworkSubsystemFailed => unreachable, // not using the network
+                else => |e0| return e0,
+            };
+            if (ready == 0) return null;
             break :blk linux.W.NOHANG;
         };
 
@@ -188,7 +192,7 @@ pub const Process = struct {
             ))) {
                 .SUCCESS => break,
                 .INTR => continue,
-                .CHILD => unreachable, // The process specified does not exist. It would be a race condition to handle this error.
+                .CHILD => return error.ProcessNotFound,
                 .INVAL => unreachable, // Invalid flags.
                 else => |e| return posix.unexpectedErrno(e),
             }
