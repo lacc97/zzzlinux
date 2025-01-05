@@ -20,19 +20,14 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    // const out_file = try std.fs.cwd().createFileZ("out.txt", .{});
-    // defer out_file.close();
+    const proc = try Process.spawn(
+        gpa,
+        "true",
+        &.{},
+        &.{"true"},
+        &.{},
+    );
+    defer proc.terminate(100);
 
-    const out_file = try std.fs.cwd().openFileZ("out.txt", .{ .mode = .write_only });
-    defer out_file.close();
-
-    const proc = try Process.spawn(gpa, "hexdump", &.{
-        .{ .dup2 = .{
-            .old = out_file.handle,
-            .new = linux.STDOUT_FILENO,
-        } },
-    }, &.{ "hexdump", "-C", "/dev/urandom" }, &.{});
     log.info("child pid: {d}", .{proc.id});
-    // try proc.signal(linux.SIG.TERM);
-    _ = try proc.wait(0);
 }

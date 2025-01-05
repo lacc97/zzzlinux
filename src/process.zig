@@ -15,8 +15,18 @@ pub const Process = struct {
         close: linux.fd_t,
     };
 
-    const SpawnError = error{
+    const SpawnError = posix.ExecveError || error{
+        SystemFdQuotaExceeded,
+        ProcessFdQuotaExceeded,
         Unexpected,
+    };
+
+    const ChildError = union(enum) {
+        exec: SpawnError,
+        file_action: struct {
+            idx: usize,
+            err: SpawnError,
+        },
     };
 
     pub fn spawn(
@@ -47,26 +57,66 @@ pub const Process = struct {
         argv: [*:null]const ?[*:0]const u8,
         envp: [*:null]const ?[*:0]const u8,
     ) SpawnError!Process {
-        if (try fork()) |child| {
-            // parent
+        // Create error communication pipes.
+        const pipe_read, const pipe_write = blk: {
+            const pipe_fds = try posix.pipe2(.{ .CLOEXEC = true });
+            break :blk .{ pipe_fds[0], pipe_fds[1] };
+        };
 
-            // TODO: error communication with child
+        const is_parent = fork() catch |e| {
+            posix.close(pipe_write);
+            posix.close(pipe_read);
+            return e;
+        };
 
-            return .{ .id = child.id, .fd = child.fd };
+        if (is_parent) |child| {
+            const p = Process{ .id = child.id, .fd = child.fd };
+            errdefer p.terminate(0);
+
+            posix.close(pipe_write);
+            defer posix.close(pipe_read);
+
+            // Read potential error from child
+            var child_err: ChildError = undefined;
+            if (posix.read(pipe_read, std.mem.asBytes(&child_err))) |bytes_read| {
+                switch (bytes_read) {
+                    // Clean EOF.
+                    0 => return p,
+
+                    // Child process reported an error.
+                    @sizeOf(ChildError) => return switch (child_err) {
+                        .exec => |e| e,
+                        .file_action => |fa| fa.err,
+                    },
+
+                    else => unreachable,
+                }
+            } else |e| {
+                std.debug.panic("{s}", .{@errorName(e)});
+            }
         } else {
-            //child
+            // We never break from this block (we must terminate either through exec or exit).
+            defer comptime unreachable;
 
-            for (file_actions) |fa| switch (fa) {
-                // CLOEXEC is unset for the duplicate file descriptor.
-                .dup2 => |args| posix.dup2(args.old, args.new) catch {},
+            posix.close(pipe_read);
 
+            // Helper to report errors back to parent
+            const err = struct {
+                fn err(fd: posix.fd_t, e: ChildError) noreturn {
+                    _ = posix.write(fd, std.mem.asBytes(&e)) catch {};
+                    linux.exit(1);
+                }
+            }.err;
+
+            // Perform file actions
+            for (file_actions, 0..) |fa, i| switch (fa) {
+                .dup2 => |args| posix.dup2(args.old, args.new) catch |e| err(pipe_write, .{ .file_action = .{ .idx = i, .err = e } }),
                 .close => |fd| posix.close(fd),
             };
 
-            // TODO: error communication with parent
-
-            posix.execvpeZ(file, argv, envp) catch {};
-            unreachable;
+            // Execute the new program
+            const e = posix.execvpeZ(file, argv, envp);
+            err(pipe_write, .{ .exec = e });
         }
     }
 
