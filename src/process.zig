@@ -54,7 +54,7 @@ pub const Process = struct {
     fn spawnImpl(
         file: [*:0]const u8,
         file_actions: []const SpawnFileAction,
-        argv: [*:null]const ?[*:0]const u8,
+        argv: [*:null]?[*:0]const u8,
         envp: [*:null]const ?[*:0]const u8,
     ) SpawnError!Process {
         // Create error communication pipes.
@@ -115,7 +115,7 @@ pub const Process = struct {
             };
 
             // Execute the new program
-            const e = posix.execvpeZ(file, argv, envp);
+            const e = posix.execvpeZ_expandArg0(.expand, file, argv, envp);
             err(pipe_write, .{ .exec = e });
         }
     }
