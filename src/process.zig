@@ -28,6 +28,55 @@ pub const Process = struct {
         },
     };
 
+    /// Creates a new process by executing the specified program.
+    ///
+    /// This function creates a new process using Linux's clone3 system call and executes
+    /// the specified program in the child process. It provides functionality for file
+    /// descriptor manipulation in the child process before program execution.
+    ///
+    /// Arguments:
+    ///   gpa: General purpose allocator used for temporary allocations during process setup
+    ///   arg_file: Path to the executable file to run
+    ///   file_actions: Array of file descriptor operations to perform in the child process
+    ///                 before executing the new program. Supports:
+    ///                 - dup2: Duplicate a file descriptor to a new number
+    ///                 - close: Close a file descriptor
+    ///   arg_argv: Array of command-line arguments for the new program
+    ///   arg_envp: Array of environment variables for the new program
+    ///
+    /// Returns:
+    ///   On success: Process struct containing:
+    ///     - id: Process ID of the new process
+    ///     - fd: File descriptor for process management (pidfd)
+    ///
+    /// Errors:
+    ///   error.OutOfMemory: Failed to allocate memory for process setup
+    ///   error.SystemFdQuotaExceeded: System-wide file descriptor limit reached
+    ///   error.ProcessFdQuotaExceeded: Process-specific file descriptor limit reached
+    ///   posix.UnexpectedError: Other system-level errors
+    ///   posix.ForkError: Failed to create new process
+    ///   posix.ExecveError: Failed to execute the new program
+    ///
+    /// Notes:
+    /// - Uses an ArenaAllocator internally for temporary allocations
+    /// - All strings are converted to null-terminated format required by POSIX
+    /// - File actions are performed in order specified
+    /// - Provides detailed error reporting from child process
+    /// - Uses modern Linux features (clone3, pidfd) for robust process management
+    ///
+    /// Example:
+    /// ```zig
+    /// const actions = [_]Process.SpawnFileAction{
+    ///     .{ .dup2 = .{ .old = stdout_pipe, .new = STDOUT_FILENO } },
+    ///     .{ .close = stderr_fd },
+    /// };
+    /// const process = try Process.spawn(
+    ///     allocator,
+    ///     "/usr/bin/ls",
+    ///     &actions,
+    ///     &.{"/usr/bin/ls", "-l"},
+    ///     &.{"PATH=/usr/bin"},
+    /// );
     pub fn spawn(
         gpa: std.mem.Allocator,
         arg_file: []const u8,
