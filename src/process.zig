@@ -15,10 +15,9 @@ pub const Process = struct {
         close: linux.fd_t,
     };
 
-    const SpawnError = posix.ExecveError || error{
+    const SpawnError = posix.UnexpectedError || posix.ForkError || posix.ExecveError || error{
         SystemFdQuotaExceeded,
         ProcessFdQuotaExceeded,
-        Unexpected,
     };
 
     const ChildError = union(enum) {
@@ -241,7 +240,7 @@ pub const Process = struct {
     }
 };
 
-fn fork() !?struct { id: linux.pid_t, fd: linux.fd_t } {
+fn fork() posix.ForkError!?struct { id: linux.pid_t, fd: linux.fd_t } {
     const clone_args = extern struct {
         flags: u64,
 
@@ -281,6 +280,8 @@ fn fork() !?struct { id: linux.pid_t, fd: linux.fd_t } {
     const rc = linux.syscall2(linux.SYS.clone3, @intFromPtr(&args), @sizeOf(@TypeOf(args)));
     return switch (linux.E.init(rc)) {
         .SUCCESS => if (rc != 0) .{ .id = @intCast(rc), .fd = fd } else null,
+        .AGAIN => return error.SystemResources,
+        .NOMEM => return error.SystemResources,
         else => |e| posix.unexpectedErrno(e),
     };
 }
