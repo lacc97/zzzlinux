@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 const posix = std.posix;
 const linux = std.os.linux;
@@ -119,7 +120,7 @@ pub const Process = struct {
 
         if (is_parent) |child| {
             const p = Process{ .id = child.id, .fd = child.fd };
-            errdefer p.terminate(0);
+            errdefer _ = p.terminate(0);
 
             posix.close(pipe_write);
             defer posix.close(pipe_read);
@@ -177,20 +178,43 @@ pub const Process = struct {
     /// Arguments:
     ///   p: Process handle to terminate
     ///   timeout_sigterm_ms: Milliseconds to wait after SIGTERM before sending SIGKILL
-    pub fn terminate(p: Process, timeout_sigterm_ms: u31) void {
+    pub fn terminate(p: Process, timeout_sigterm_ms: u31) ExitInfo {
         // No matter what at the end of the function this handle must be closed.
         defer p.close();
 
         // Optimistically check if process is already ended.
-        if ((p.wait(0) catch @panic("todo"))) |_| return;
+        if ((p.waitForExit(0) catch |e| switch (e) {
+            // Process has already been waited on before.
+            error.ProcessNotFound => return .unknown,
+            else => @panic("todo"),
+        })) |exit_info| return exit_info;
 
         // Ask nicely with SIGTERM.
-        p.signal(posix.SIG.TERM) catch @panic("todo");
-        if (p.wait(timeout_sigterm_ms) catch @panic("todo")) |_| return;
+        p.signal(posix.SIG.TERM) catch |e| switch (e) {
+            // This should not be possible because the previous
+            // call to wait indicated we still have process
+            // around. It might indicate a race condition (TODO: panic?).
+            error.ProcessNotFound => unreachable,
+            else => @panic("todo"),
+        };
+        if (p.waitForExit(timeout_sigterm_ms) catch |e| switch (e) {
+            // This should not be possible because the previous
+            // call to wait indicated we still have process
+            // around. It might indicate a race condition (TODO: panic?).
+            error.ProcessNotFound => unreachable,
+            else => @panic("todo"),
+        }) |exit_info| return exit_info;
 
         // No longer asking.
         p.signal(posix.SIG.KILL) catch {};
-        _ = p.wait(0) catch {};
+        if (p.waitForExit(1) catch |e| switch (e) {
+            // This should not be possible because the previous
+            // call to wait indicated we still have process
+            // around. It might indicate a race condition (TODO: panic?).
+            error.ProcessNotFound => unreachable,
+            else => @panic("todo"),
+        }) |exit_info| return exit_info;
+        return .unknown;
     }
 
     /// Closes the process handle.
@@ -198,6 +222,12 @@ pub const Process = struct {
     pub fn close(p: Process) void {
         posix.close(p.fd);
     }
+
+    pub const ExitInfo = union(enum) {
+        exited: i32,
+        signal: i32,
+        unknown,
+    };
 
     /// Waits for the process to exit with a timeout.
     ///
@@ -208,11 +238,11 @@ pub const Process = struct {
     ///
     /// Returns:
     ///   null if the process has not exited within timeout period
-    ///   siginfo_t struct containing process exit information if process has exited
+    ///   ExitInfo struct containing process exit information if process has exited
     ///
     /// Errors:
     ///   TODO
-    pub fn wait(p: Process, arg_timeout_ms: i32) !?linux.siginfo_t {
+    pub fn waitForExit(p: Process, arg_timeout_ms: i32) !?ExitInfo {
         const flag_nohang: u32 = blk: {
             // Infinite timeout.
             if (arg_timeout_ms < 0) break :blk 0;
@@ -230,26 +260,16 @@ pub const Process = struct {
             break :blk linux.W.NOHANG;
         };
 
-        var siginfo: linux.siginfo_t = undefined;
-        while (true) {
-            switch (linux.E.init(linux.waitid(
-                linux.P.PIDFD,
-                p.fd,
-                &siginfo,
-                linux.W.EXITED | flag_nohang,
-            ))) {
-                .SUCCESS => break,
-                .INTR => continue,
-                .CHILD => return error.ProcessNotFound,
-                .INVAL => unreachable, // Invalid flags.
-                else => |e| return posix.unexpectedErrno(e),
-            }
+        if (try waitid(linux.P.PIDFD, p.fd, linux.W.EXITED | flag_nohang)) |wait_info| {
+            assert(p.id == wait_info.pid);
+            return switch (wait_info.code) {
+                .EXITED => .{ .exited = wait_info.status },
+                .KILLED, .DUMPED => .{ .signal = wait_info.status },
+                .STOPPED, .TRAPPED, .CONTINUED => unreachable,
+            };
+        } else {
+            return null;
         }
-
-        // If WNOHANG is specified and the status is not available,
-        // waitid returns zero and sets si_signo and si_pid in
-        // siginfo to zero.
-        return if (siginfo.signo != 0) siginfo else null;
     }
 
     /// Sends a signal to the process.
@@ -332,5 +352,63 @@ fn fork() posix.ForkError!?struct { id: linux.pid_t, fd: linux.fd_t } {
         .AGAIN => return error.SystemResources,
         .NOMEM => return error.SystemResources,
         else => |e| posix.unexpectedErrno(e),
+    };
+}
+
+const WaitInfo = struct {
+    code: CLD,
+    pid: linux.pid_t,
+    uid: linux.uid_t,
+    status: i32,
+};
+
+const CLD = enum(i32) {
+    // child has exited
+    EXITED = 1,
+    // child was killed
+    KILLED = 2,
+    // child terminated abnormally
+    DUMPED = 3,
+    // traced child has trapped
+    TRAPPED = 4,
+    // child has stopped
+    STOPPED = 5,
+    // stopped child has continued
+    CONTINUED = 6,
+};
+
+fn waitid(id_type: linux.P, id: i32, options: u32) !?WaitInfo {
+    var siginfo: linux.siginfo_t = undefined;
+
+    // wait(2) manpage suggests setting si_pid to 0 and checking for
+    // a non-zero value after the call returns to distinguish between
+    // successfully waiting for a child vs passing WNOHANG with
+    // no waitable children.
+    siginfo.fields.common.first.piduid.pid = 0;
+
+    while (true) switch (linux.E.init(linux.waitid(
+        id_type,
+        id,
+        &siginfo,
+        options,
+    ))) {
+        .SUCCESS => break,
+        .AGAIN => return null,
+        .INTR => continue,
+        .CHILD => return error.ProcessNotFound,
+        .INVAL => unreachable, // Invalid flags.
+        else => |e| return posix.unexpectedErrno(e),
+    };
+
+    if (siginfo.fields.common.first.piduid.pid == 0) {
+        // See above comment.
+        return null;
+    }
+
+    return .{
+        .code = @enumFromInt(siginfo.code),
+        .pid = siginfo.fields.common.first.piduid.pid,
+        .uid = siginfo.fields.common.first.piduid.uid,
+        .status = siginfo.fields.common.second.sigchld.status,
     };
 }

@@ -27,7 +27,11 @@ pub fn main() !void {
         &.{"true"},
         &.{},
     );
-    defer proc.terminate(100);
+    defer {
+        const exit_info = proc.terminate(100);
+        log.info("exited with {any}", .{exit_info});
+    }
 
     log.info("child pid: {d}", .{proc.id});
+    std.time.sleep(100 * std.time.ns_per_ms);
 }
