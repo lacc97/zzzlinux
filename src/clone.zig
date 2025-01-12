@@ -28,10 +28,11 @@ pub fn main() !void {
         &.{},
     );
     defer {
-        const exit_info = proc.terminate(100);
-        log.info("exited with {any}", .{exit_info});
+        const exit_info1 = proc.terminate(100);
+        log.info("exited with {any}", .{exit_info1});
     }
 
     log.info("child pid: {d}", .{proc.id});
-    std.time.sleep(100 * std.time.ns_per_ms);
+    const exit_info2 = try proc.waitForExit(.{ .timeout_ms = -1 }) orelse unreachable;
+    log.info("waited for exit with {any}", .{exit_info2});
 }

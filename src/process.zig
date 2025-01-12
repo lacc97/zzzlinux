@@ -183,36 +183,37 @@ pub const Process = struct {
         defer p.close();
 
         // Optimistically check if process is already ended.
-        if ((p.waitForExit(0) catch |e| switch (e) {
-            // Process has already been waited on before.
+        if ((p.waitForExit(.{ .timeout_ms = 0, .reap_child = true }) catch |e| switch (e) {
+            // Child process has already been reaped.
             error.ProcessNotFound => return .unknown,
-            else => @panic("todo"),
+
+            else => return .unknown,
         })) |exit_info| return exit_info;
 
         // Ask nicely with SIGTERM.
         p.signal(posix.SIG.TERM) catch |e| switch (e) {
             // This should not be possible because the previous
             // call to wait indicated we still have process
-            // around. It might indicate a race condition (TODO: panic?).
-            error.ProcessNotFound => unreachable,
-            else => @panic("todo"),
+            // around. It might indicate a race condition.
+            error.ProcessNotFound => return .unknown,
+            else => return .unknown,
         };
-        if (p.waitForExit(timeout_sigterm_ms) catch |e| switch (e) {
+        if (p.waitForExit(.{ .timeout_ms = timeout_sigterm_ms, .reap_child = true }) catch |e| switch (e) {
             // This should not be possible because the previous
             // call to wait indicated we still have process
-            // around. It might indicate a race condition (TODO: panic?).
-            error.ProcessNotFound => unreachable,
-            else => @panic("todo"),
+            // around. It might indicate a race condition.
+            error.ProcessNotFound => .unknown,
+            else => .unknown,
         }) |exit_info| return exit_info;
 
         // No longer asking.
         p.signal(posix.SIG.KILL) catch {};
-        if (p.waitForExit(1) catch |e| switch (e) {
+        if (p.waitForExit(.{ .timeout_ms = 1, .reap_child = true }) catch |e| switch (e) {
             // This should not be possible because the previous
             // call to wait indicated we still have process
-            // around. It might indicate a race condition (TODO: panic?).
-            error.ProcessNotFound => unreachable,
-            else => @panic("todo"),
+            // around. It might indicate a race condition.
+            error.ProcessNotFound => .unknown,
+            else => .unknown,
         }) |exit_info| return exit_info;
         return .unknown;
     }
@@ -229,6 +230,11 @@ pub const Process = struct {
         unknown,
     };
 
+    pub const WaitForExitOptions = struct {
+        timeout_ms: i32,
+        reap_child: bool = false,
+    };
+
     /// Waits for the process to exit with a timeout.
     ///
     /// Arguments:
@@ -242,17 +248,17 @@ pub const Process = struct {
     ///
     /// Errors:
     ///   TODO
-    pub fn waitForExit(p: Process, arg_timeout_ms: i32) !?ExitInfo {
+    pub fn waitForExit(p: Process, opts: WaitForExitOptions) !?ExitInfo {
         const flag_nohang: u32 = blk: {
             // Infinite timeout.
-            if (arg_timeout_ms < 0) break :blk 0;
+            if (opts.timeout_ms < 0) break :blk 0;
 
             // Zero timeout.
-            if (arg_timeout_ms == 0) break :blk linux.W.NOHANG;
+            if (opts.timeout_ms == 0) break :blk linux.W.NOHANG;
 
             // Other timeout.
             var poll_fds = [_]posix.pollfd{.{ .fd = p.fd, .events = linux.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&poll_fds, arg_timeout_ms) catch |e| switch (e) {
+            const ready = posix.poll(&poll_fds, opts.timeout_ms) catch |e| switch (e) {
                 error.NetworkSubsystemFailed => unreachable, // not using the network
                 else => |e0| return e0,
             };
@@ -260,7 +266,15 @@ pub const Process = struct {
             break :blk linux.W.NOHANG;
         };
 
-        if (try waitid(linux.P.PIDFD, p.fd, linux.W.EXITED | flag_nohang)) |wait_info| {
+        const flag_nowait: u32 = if (!opts.reap_child) linux.W.NOWAIT else 0;
+
+        if (try waitid(
+            linux.P.PIDFD,
+            p.fd,
+            // We set NOWAIT so we can always retrieve the status
+            // again (especially during terminate()).
+            linux.W.EXITED | flag_nowait | flag_nohang,
+        )) |wait_info| {
             assert(p.id == wait_info.pid);
             return switch (wait_info.code) {
                 .EXITED => .{ .exited = wait_info.status },
