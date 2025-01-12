@@ -186,7 +186,7 @@ pub const Process = struct {
 
         const reap = struct {
             inline fn reap(arg_p: Process, timeout_ms: i32) !?ExitInfo {
-                return arg_p.waitForExit(.{ .timeout_ms = timeout_ms, .reap = true });
+                return arg_p.waitForExit(.{ .timeout_ms = timeout_ms, .reap_child = true });
             }
         }.reap;
 
