@@ -52,6 +52,7 @@ pub const Process = struct {
     ///
     /// Errors:
     ///   error.OutOfMemory: Failed to allocate memory for process setup
+    ///   error.SystemResources: System resource limits reached (memory, processes, etc.)
     ///   error.SystemFdQuotaExceeded: System-wide file descriptor limit reached
     ///   error.ProcessFdQuotaExceeded: Process-specific file descriptor limit reached
     ///   posix.UnexpectedError: Other system-level errors
@@ -62,8 +63,9 @@ pub const Process = struct {
     /// - Uses an ArenaAllocator internally for temporary allocations
     /// - All strings are converted to null-terminated format required by POSIX
     /// - File actions are performed in order specified
-    /// - Provides detailed error reporting from child process
+    /// - Provides detailed error reporting from child process via pipe
     /// - Uses modern Linux features (clone3, pidfd) for robust process management
+    /// - Child process errors are communicated back to parent through ChildError union
     ///
     /// Example:
     /// ```zig
@@ -239,15 +241,22 @@ pub const Process = struct {
     ///
     /// Arguments:
     ///   p: Process handle to wait for
-    ///   arg_timeout_ms: Timeout in milliseconds. Use negative value for infinite wait,
-    ///                   0 for immediate return, or positive value for timed wait.
+    ///   opts: WaitForExitOptions struct containing:
+    ///     - timeout_ms: Timeout in milliseconds. Use negative value for infinite wait,
+    ///                   0 for immediate return, or positive value for timed wait
+    ///     - reap_child: If true, reaps the child process. If false, leaves the process
+    ///                   in a waitable state (using WNOWAIT)
     ///
     /// Returns:
     ///   null if the process has not exited within timeout period
-    ///   ExitInfo struct containing process exit information if process has exited
+    ///   ExitInfo union containing either:
+    ///     - exited: Normal process exit with status code
+    ///     - signal: Process terminated by signal
+    ///     - unknown: Process state could not be determined
     ///
     /// Errors:
-    ///   TODO
+    ///   error.ProcessNotFound: Process no longer exists or has already been reaped
+    ///   posix.UnexpectedError: Other system-level errors
     pub fn waitForExit(p: Process, opts: WaitForExitOptions) !?ExitInfo {
         const flag_nohang: u32 = blk: {
             // Infinite timeout.
