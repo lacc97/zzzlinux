@@ -184,8 +184,14 @@ pub const Process = struct {
         // No matter what at the end of the function this handle must be closed.
         defer p.close();
 
+        const reap = struct {
+            inline fn reap(arg_p: Process, timeout_ms: i32) !?ExitInfo {
+                return arg_p.waitForExit(.{ .timeout_ms = timeout_ms, .reap = true });
+            }
+        }.reap;
+
         // Optimistically check if process is already ended.
-        if ((p.waitForExit(.{ .timeout_ms = 0, .reap_child = true }) catch |e| switch (e) {
+        if ((reap(p, 0) catch |e| switch (e) {
             // Child process has already been reaped.
             error.ProcessNotFound => return .unknown,
 
@@ -200,7 +206,7 @@ pub const Process = struct {
             error.ProcessNotFound => return .unknown,
             else => return .unknown,
         };
-        if (p.waitForExit(.{ .timeout_ms = timeout_sigterm_ms, .reap_child = true }) catch |e| switch (e) {
+        if (reap(p, timeout_sigterm_ms) catch |e| switch (e) {
             // This should not be possible because the previous
             // call to wait indicated we still have process
             // around. It might indicate a race condition.
@@ -210,7 +216,7 @@ pub const Process = struct {
 
         // No longer asking.
         p.signal(posix.SIG.KILL) catch {};
-        if (p.waitForExit(.{ .timeout_ms = 1, .reap_child = true }) catch |e| switch (e) {
+        if (reap(p, 1) catch |e| switch (e) {
             // This should not be possible because the previous
             // call to wait indicated we still have process
             // around. It might indicate a race condition.
