@@ -226,11 +226,136 @@ pub const Process = struct {
         return .unknown;
     }
 
+    pub fn terminateAll(
+        gpa: std.mem.Allocator,
+        ps: []const Process,
+        infos_buf_opt: ?[]ExitInfo,
+        timeout_sigterm_ms: u31,
+    ) error{OutOfMemory}!void {
+        const isReady = struct {
+            fn isReady(i: WaitForExitError!?ExitInfo) bool {
+                return (i catch return true) != null;
+            }
+        }.isReady;
+
+        const Helper = struct {
+            procs: []const Process,
+            infos: []WaitForExitError!?ExitInfo,
+
+            scratch_buf: std.MultiArrayList(struct {
+                proc: Process,
+                info: WaitForExitError!?ExitInfo,
+            }),
+
+            fn init(
+                allocator: std.mem.Allocator,
+                procs: []const Process,
+            ) error{OutOfMemory}!@This() {
+                const infos = try allocator.alloc(WaitForExitError!?ExitInfo, procs.len);
+                errdefer allocator.free(infos);
+                @memset(infos, null);
+
+                var self: @This() = .{
+                    .procs = procs,
+                    .infos = infos,
+                    .scratch_buf = .{},
+                };
+                try self.scratch_buf.ensureTotalCapacity(allocator, procs.len);
+                errdefer self.scratch_buf.deinit(allocator);
+                return self;
+            }
+
+            fn deinit(
+                self: *@This(),
+                allocator: std.mem.Allocator,
+            ) void {
+                self.scratch_buf.deinit(allocator);
+                allocator.free(self.infos);
+            }
+
+            fn reapRemaining(
+                self: *@This(),
+                allocator: std.mem.Allocator,
+                timeout_ms: u31,
+            ) error{OutOfMemory}!void {
+                self.scratch_buf.shrinkRetainingCapacity(0);
+                defer self.scratch_buf.shrinkRetainingCapacity(0);
+
+                for (self.procs, self.infos) |p, info_or_err| {
+                    if (!isReady(info_or_err)) {
+                        self.scratch_buf.appendAssumeCapacity(.{
+                            .proc = p,
+                            .info = undefined,
+                        });
+                    }
+                }
+                waitAllForExit(
+                    allocator,
+                    self.scratch_buf.items(.proc),
+                    self.scratch_buf.items(.info),
+                    .{ .timeout_ms = timeout_ms, .reap_child = true },
+                ) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        for (self.infos) |*info_or_err| info_or_err.* = .unknown;
+                        return;
+                    },
+                };
+
+                const scratch_infos = self.scratch_buf.items(.info);
+                var i: usize = 0;
+                for (self.infos) |*info_or_err| {
+                    if (!isReady(info_or_err.*)) {
+                        info_or_err.* = scratch_infos[i];
+                        i += 1;
+                    }
+                }
+            }
+
+            fn signalRemaining(self: *@This(), sig: i32) void {
+                for (self.procs, self.infos) |p, *info_or_err| {
+                    if (!isReady(info_or_err.*)) {
+                        p.signal(sig) catch {
+                            info_or_err.* = .unknown;
+                        };
+                    }
+                }
+            }
+        };
+
+        if (infos_buf_opt) |infos_buf| assert(ps.len == infos_buf.len);
+
+        var h = try Helper.init(gpa, ps);
+        defer h.deinit(gpa);
+
+        // Optimistically check if process is already ended.
+        try h.reapRemaining(gpa, 0);
+
+        // Ask nicely with SIGTERM.
+        h.signalRemaining(linux.SIG.TERM);
+        try h.reapRemaining(gpa, timeout_sigterm_ms);
+
+        // No longer asking.
+        h.signalRemaining(linux.SIG.KILL);
+        try h.reapRemaining(gpa, 1);
+
+        // Save results if needed.
+        if (infos_buf_opt) |infos_buf| {
+            for (h.infos, infos_buf) |info_or_err, *info| {
+                info.* = (info_or_err catch .unknown).?;
+            }
+        }
+    }
+
     /// Closes the process handle.
     /// This does not terminate the process, it only closes the file descriptor.
     pub fn close(p: Process) void {
         posix.close(p.fd);
     }
+
+    pub const WaitForExitError = posix.PollError || posix.UnexpectedError || error{
+        ProcessNotFound,
+    };
 
     pub const ExitInfo = union(enum) {
         exited: i32,
@@ -283,12 +408,75 @@ pub const Process = struct {
 
         const flag_nowait: u32 = if (!opts.reap_child) linux.W.NOWAIT else 0;
 
+        return try p.waitForExitImpl(linux.W.EXITED | flag_nowait | flag_nohang);
+    }
+
+    pub fn waitAllForExit(
+        gpa: std.mem.Allocator,
+        ps: []const Process,
+        infos_buf: []WaitForExitError!?ExitInfo,
+        opts: WaitForExitOptions,
+    ) !void {
+        assert(ps.len == infos_buf.len);
+
+        const flag_nowait: u32 = if (!opts.reap_child) linux.W.NOWAIT else 0;
+
+        if (opts.timeout_ms == 0) {
+            for (ps, infos_buf) |p, *info_or_err| {
+                info_or_err.* = p.waitForExitImpl(linux.W.EXITED | flag_nowait | linux.W.NOHANG);
+            }
+            return;
+        }
+
+        const isReady = struct {
+            fn isReady(i: WaitForExitError!?ExitInfo) bool {
+                return (i catch return true) != null;
+            }
+        }.isReady;
+
+        var poll_fds = try std.ArrayListUnmanaged(posix.pollfd).initCapacity(gpa, infos_buf.len);
+        defer poll_fds.deinit(gpa);
+
+        for (infos_buf) |*info_or_err| info_or_err.* = null;
+
+        const t_start = if (opts.timeout_ms > 0) (std.time.Instant.now() catch unreachable) else undefined;
+        while (true) {
+            if (opts.timeout_ms > 0) {
+                // Check for timeout reached.
+                const t_now = std.time.Instant.now() catch unreachable;
+                if ((t_now.since(t_start) / std.time.ns_per_ms) > opts.timeout_ms) break;
+            }
+
+            poll_fds.clearRetainingCapacity();
+            for (ps, infos_buf) |p, info_or_err| {
+                if (!isReady(info_or_err)) {
+                    poll_fds.appendAssumeCapacity(.{ .fd = p.fd, .events = linux.POLL.IN, .revents = 0 });
+                }
+            }
+
+            // We are done.
+            if (poll_fds.items.len == 0) break;
+
+            if (posix.poll(poll_fds.items, opts.timeout_ms) catch |e| switch (e) {
+                error.NetworkSubsystemFailed => unreachable, // not using the network
+                else => |e0| return e0,
+            } == 0) break;
+
+            var i: usize = 0;
+            for (ps, infos_buf) |p, *info_or_err| {
+                if (!isReady(info_or_err.*) and poll_fds.items[i].revents != 0) {
+                    info_or_err.* = p.waitForExitImpl(linux.W.EXITED | flag_nowait | linux.W.NOHANG);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn waitForExitImpl(p: Process, options: u32) error{ ProcessNotFound, Unexpected }!?ExitInfo {
         if (try waitid(
             linux.P.PIDFD,
             p.fd,
-            // We set NOWAIT so we can always retrieve the status
-            // again (especially during terminate()).
-            linux.W.EXITED | flag_nowait | flag_nohang,
+            options,
         )) |wait_info| {
             assert(p.id == wait_info.pid);
             return switch (wait_info.code) {

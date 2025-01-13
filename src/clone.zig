@@ -20,6 +20,20 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
+    var procs = std.ArrayListUnmanaged(Process){};
+    defer procs.deinit(gpa);
+    defer Process.terminateAll(gpa, procs.items, null, 100) catch unreachable;
+
+    for (0..10) |_| {
+        try procs.append(gpa, try Process.spawn(
+            gpa,
+            "sleep",
+            &.{},
+            &.{ "sleep", "10" },
+            &.{},
+        ));
+    }
+
     const proc = try Process.spawn(
         gpa,
         "true",
