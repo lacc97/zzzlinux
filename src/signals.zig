@@ -136,6 +136,28 @@ pub fn unblock(old_mask: SigSet) void {
     posix.sigprocmask(posix.SIG.SETMASK, &old_mask, null);
 }
 
+test "signal blocking and unblocking" {
+    const testing = std.testing;
+
+    const old_set = block(.{});
+    errdefer unblock(old_set);
+
+    const pipe = try installTerminationHandler();
+    defer uninstallTerminationHandler();
+
+    var buf: [256]u8 = undefined;
+
+    for (TerminationState.signals) |sig| try posix.raise(sig);
+
+    try testing.expectError(error.WouldBlock, posix.read(pipe, &buf));
+
+    unblock(old_set);
+
+    try testing.expectEqual(@as(usize, 2), try posix.read(pipe, &buf));
+    try testing.expectEqual(@as(u8, 1), buf[0]);
+    try testing.expectEqual(@as(u8, 1), buf[1]);
+}
+
 const sigaddset = linux.sigaddset;
 
 fn sigdelset(set: *linux.sigset_t, sig: u6) void {
