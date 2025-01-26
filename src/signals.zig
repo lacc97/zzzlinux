@@ -1,10 +1,94 @@
 const std = @import("std");
+const panic = std.debug.panic;
 
 const posix = std.posix;
 const linux = std.os.linux;
 
 /// Type alias for POSIX signal set type.
 pub const SigSet = posix.sigset_t;
+
+const TerminationState = struct {
+    pipes: [2]posix.fd_t,
+    old_actions: [signals.len]posix.Sigaction,
+
+    const signals = [_]u6{ posix.SIG.INT, posix.SIG.TERM };
+};
+
+var termination_state: ?TerminationState = null;
+
+pub fn installTerminationHandler() !posix.fd_t {
+    if (termination_state != null) panic("termination handler is already installed", .{});
+
+    termination_state = @as(TerminationState, undefined);
+    errdefer termination_state = null;
+
+    const state: *TerminationState = &termination_state.?;
+
+    state.pipes = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    errdefer {
+        posix.close(state.pipes[0]);
+        posix.close(state.pipes[1]);
+    }
+
+    const new_action: posix.Sigaction = .{
+        .handler = .{ .handler = terminationHandler },
+        .mask = mask_blk: {
+            var mask: SigSet = posix.empty_sigset;
+            inline for (TerminationState.signals) |sig| sigaddset(&mask, sig);
+            break :mask_blk mask;
+        },
+        .flags = 0,
+    };
+    inline for (TerminationState.signals, &state.old_actions) |sig, *old_action| {
+        posix.sigaction(sig, &new_action, old_action) catch unreachable;
+    }
+    errdefer for (TerminationState.signals, &state.old_actions) |sig, *old_action| {
+        posix.sigaction(sig, old_action, null) catch unreachable;
+    };
+
+    return state.pipes[0];
+}
+
+pub fn uninstallTerminationHandler() void {
+    if (termination_state == null) panic("termination handler is not installed", .{});
+
+    const state: *TerminationState = &termination_state.?;
+
+    for (TerminationState.signals, &state.old_actions) |sig, *old_action| {
+        posix.sigaction(sig, old_action, null) catch unreachable;
+    }
+
+    posix.close(state.pipes[0]);
+    posix.close(state.pipes[1]);
+
+    termination_state = null;
+}
+
+fn terminationHandler(sig: i32) callconv(.C) void {
+    _ = sig; // autofix
+    if (termination_state) |*state| {
+        const cookie: u8 = 1;
+        _ = posix.write(state.pipes[1], std.mem.asBytes(&cookie)) catch {};
+    }
+}
+
+test "termination signal handler" {
+    const testing = std.testing;
+
+    for (TerminationState.signals) |sig| {
+        const pipe = try installTerminationHandler();
+        defer uninstallTerminationHandler();
+
+        var buf: [256]u8 = undefined;
+
+        try testing.expectError(error.WouldBlock, posix.read(pipe, &buf));
+
+        try posix.raise(sig);
+
+        try testing.expectEqual(@as(usize, 1), try posix.read(pipe, &buf));
+        try testing.expectEqual(@as(u8, 1), buf[0]);
+    }
+}
 
 /// Options for controlling signal blocking behaviour.
 pub const BlockOptions = struct {
@@ -51,6 +135,8 @@ pub fn block(opts: BlockOptions) SigSet {
 pub fn unblock(old_mask: SigSet) void {
     posix.sigprocmask(posix.SIG.SETMASK, &old_mask, null);
 }
+
+const sigaddset = linux.sigaddset;
 
 fn sigdelset(set: *linux.sigset_t, sig: u6) void {
     const s = sig - 1;
