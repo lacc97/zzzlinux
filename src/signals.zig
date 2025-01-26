@@ -7,6 +7,8 @@ const linux = std.os.linux;
 /// Type alias for POSIX signal set type.
 pub const SigSet = posix.sigset_t;
 
+/// Internal state for the termination handler.
+/// Stores the pipe file descriptors and previous signal handlers.
 const TerminationState = struct {
     pipes: [2]posix.fd_t,
     old_actions: [signals.len]posix.Sigaction,
@@ -16,6 +18,31 @@ const TerminationState = struct {
 
 var termination_state: ?TerminationState = null;
 
+/// Installs a signal handler for graceful process termination.
+///
+/// This function sets up handlers for SIGINT and SIGTERM that will write to a pipe
+/// when triggered. This allows for asynchronous signal handling to be converted into
+/// synchronous events that can be monitored using standard I/O operations.
+///
+/// Can only be installed once - attempting to install multiple times will panic.
+///
+/// Returns:
+///   File descriptor for reading termination events. When a termination signal is
+///   received, a single byte (1) will be written to this descriptor.
+///   The descriptor is set to non-blocking mode.
+///
+/// Errors:
+///   error.SystemFdQuotaExceeded: System has reached its file descriptor limit
+///   error.ProcessFdQuotaExceeded: Process has reached its file descriptor limit
+///   error.SystemResources: Insufficient kernel memory
+///
+/// Example:
+/// ```zig
+/// const term_fd = try signals.installTerminationHandler();
+/// defer signals.uninstallTerminationHandler();
+///
+/// // Monitor term_fd for termination signals...
+/// ```
 pub fn installTerminationHandler() !posix.fd_t {
     if (termination_state != null) panic("termination handler is already installed", .{});
 
@@ -49,6 +76,24 @@ pub fn installTerminationHandler() !posix.fd_t {
     return state.pipes[0];
 }
 
+/// Removes the termination signal handler and restores previous handlers.
+///
+/// This function:
+/// - Restores the previous signal handlers for SIGINT and SIGTERM
+/// - Closes the pipe file descriptors
+/// - Cleans up internal state
+///
+/// Must be called after installTerminationHandler() - attempting to uninstall
+/// when no handler is installed will panic.
+///
+/// This should typically be called using defer immediately after installing
+/// the handler to ensure cleanup.
+///
+/// Example:
+/// ```zig
+/// const term_fd = try signals.installTerminationHandler();
+/// defer signals.uninstallTerminationHandler();
+/// ```
 pub fn uninstallTerminationHandler() void {
     if (termination_state == null) panic("termination handler is not installed", .{});
 
